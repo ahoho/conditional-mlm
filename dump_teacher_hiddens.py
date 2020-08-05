@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import shelve
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -55,10 +56,10 @@ def gather_hiddens(hiddens, masks):
 class LineByLinePairedTextDatasetWithID(LineByLinePairedTextDataset):
     def __getitem__(self, i):
         example = super().__getitem__(i)
-        example["id"] = i
+        example["id"] = str(i)
         return example
 
-
+@dataclass
 class DataCollatorForMLMQuery(DataCollatorForConditionalMLM):
     """
     Sequentially mask each word in a dataset so that we can query the 
@@ -127,6 +128,7 @@ class DataCollatorForMLMQuery(DataCollatorForConditionalMLM):
         assert (masks.sum(dim=0) != torch.ones(tgt_len).long()).sum().item() == 0
         assert masks.sum().item() == tgt_len
         masks = torch.cat([torch.zeros(self.num_samples, src_len).byte(), masks], dim=1)
+        masks = masks.bool()
 
         # make BERT inputs
         input_ids = example['input_ids'].repeat((self.num_samples, 1))
@@ -147,7 +149,12 @@ def process_batch(batch, model):
     """
     Pass the batch through the model
     """
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor):
+            batch[k] = v.to(model.device)
+    
     all_masks = batch.pop("masks")
+    all_masks = [m.to(model.device) for m in all_masks]
 
     if model.config.model_type == "bert":
         outputs = model.bert(**batch)
@@ -169,7 +176,15 @@ def process_batch(batch, model):
     return all_hiddens
 
 
-def build_db_batched(source_path, target_path, out_db, model, tokenizer, batch_size=8):
+def build_db_batched(
+    source_path,
+    target_path,
+    out_db,
+    model,
+    tokenizer,
+    batch_size=8,
+    output_dtype=np.float32,
+):
     """
     Use the model to give outputs for each target token in the dataset
     """
@@ -189,7 +204,7 @@ def build_db_batched(source_path, target_path, out_db, model, tokenizer, batch_s
             ids = batch.pop("ids")
             outputs = process_batch(batch, model)
             for id, output in zip(ids, outputs):
-                out_db[id] = tensor_dumps(output)
+                out_db[id] = tensor_dumps(output, dtype=output_dtype)
             pbar.update(len(ids))
 
 
@@ -200,16 +215,15 @@ def main(opts):
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info("Training/evaluation parameters %s", training_args)
 
     # load model & tokenizer
     tokenizer = AutoTokenizer.from_pretrained(opts.model_name_or_path)
 
-    model = AutoModelWithLMHead.from_pretrained(opts.model_name_or_path)
+    model = AutoModelForMaskedLM.from_pretrained(opts.model_name_or_path)
     model.eval()
     if torch.cuda.is_available():
         model.cuda()
-    if self.args.fp16:
+    if opts.fp16:
         if not is_apex_available():
             raise ImportError(
                 "Please install apex to use fp16 training."
@@ -217,6 +231,8 @@ def main(opts):
         model = amp.initialize(model, opt_level="O1") # default level from transformers
     
     # store decoder for quickly producing logits from hidden states
+    os.makedirs(opts.output_dir, exist_ok=opts.overwrite)
+    torch.save(opts, f"{opts.output_dir}/args.bin")
     if model.config.model_type == "bert":
         torch.save(model.cls.predictions.decoder, f"{opts.output_dir}/linear.pt")
     if model.config.model_type == "roberta":
@@ -230,12 +246,8 @@ def main(opts):
             model=model,
             tokenizer=tokenizer,
             batch_size=opts.batch_size,
+            output_dtype=np.float16 if opts.fp16 else np.float32,
         )
-
-    # create DB
-    with shelve.open(f'{opts.output}/db') as out_db, \
-            torch.no_grad():
-        build_db_batched(opts.db, out_db, bert, toker)
 
 
 if __name__ == '__main__':
@@ -248,8 +260,9 @@ if __name__ == '__main__':
     parser.add_argument('--source_path', required=True, help="Location of source docs")
     parser.add_argument('--target_path', required=True, help="Location of target docs")
     parser.add_argument('--output_dir', required=True, help='Dump output to this dir')
-    parser.add_argument('--fp16', actions="store_true", default=False)
-    parser.add_argument('--batch_size', )
+    parser.add_argument('--fp16', action="store_true", default=False)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--overwrite', action="store_true", default=False)
     args = parser.parse_args()
 
     main(args)
