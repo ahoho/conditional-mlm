@@ -16,7 +16,7 @@ from transformers import (
     CONFIG_MAPPING,
     MODEL_WITH_LM_HEAD_MAPPING,
     AutoConfig,
-    AutoModelWithLMHead,
+    AutoModelForMaskedLM,
     AutoTokenizer,
     HfArgumentParser,
     PreTrainedTokenizer,
@@ -156,6 +156,12 @@ def main():
         bool(training_args.local_rank != -1),
         training_args.fp16,
     )
+    
+    # Log to file
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    fh = logging.FileHandler(f"{training_args.output_dir}/output.log")
+    fh.setLevel(logging.INFO)
+    logger.addHandler(fh)
     logger.info("Training/evaluation parameters %s", training_args)
 
     # Set seed
@@ -186,7 +192,7 @@ def main():
         )
 
     if model_args.model_name_or_path:
-        model = AutoModelWithLMHead.from_pretrained(
+        model = AutoModelForMaskedLM.from_pretrained(
             model_args.model_name_or_path,
             from_tf=bool(".ckpt" in model_args.model_name_or_path),
             config=config,
@@ -194,7 +200,7 @@ def main():
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelWithLMHead.from_config(config)
+        model = AutoModelForMaskedLM.from_config(config)
 
     # add added tokens
     if data_args.added_tokens_file is not None:
