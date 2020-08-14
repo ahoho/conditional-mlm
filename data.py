@@ -24,6 +24,7 @@ class LineByLinePairedTextDataset(Dataset):
         """
         Read source and target lines from 
         """
+        self.tokenizer = tokenizer
         source_lines = self.read_lines_from_file(source_file_path)
         target_lines = self.read_lines_from_file(target_file_path)
         assert(len(source_lines) == len(target_lines))
@@ -67,7 +68,7 @@ class DataCollatorForConditionalMLM:
 
     def _tensorize_batch(self, examples: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         if len(examples) == 1:
-            return examples
+            return examples[0]
         
         if self.tokenizer._pad_token is None:
             raise ValueError(
