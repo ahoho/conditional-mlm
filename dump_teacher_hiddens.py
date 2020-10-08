@@ -24,7 +24,7 @@ from transformers import (
 )
 from transformers.file_utils import is_apex_available
 
-from data import LineByLinePairedTextDataset, DataCollatorForConditionalMLM
+from data import LineByLinePairedTextDataset, SimpleDataCollator
 
 if is_apex_available():
     from apex import amp
@@ -54,15 +54,17 @@ def gather_hiddens(hiddens, masks):
 
 
 class LineByLinePairedTextDatasetWithID(LineByLinePairedTextDataset):
+
     def __getitem__(self, i):
         example = super().__getitem__(i)
         example["id"] = str(i)
         return example
 
+
 @dataclass
-class DataCollatorForMLMQuery(DataCollatorForConditionalMLM):
+class DataCollatorForMLMQuery(SimpleDataCollator):
     """
-    Sequentially mask each word in a dataset so that we can query the 
+    Sequentially mask each token in a dataset so that we can query the logits
 
     TODO: Is masking necessary? Can't we just get the outputs of the model on the
     complete, unmasked data?
@@ -109,8 +111,6 @@ class DataCollatorForMLMQuery(DataCollatorForConditionalMLM):
         new transformers library. Masks all words in an example
         """
         target_mask = example['token_type_ids'].bool()
-        src = example['input_ids'][~target_mask]
-        tgt = example['input_ids'][target_mask]
 
         # build the random masks
         tgt_len = example['token_type_ids'].sum().item()
@@ -133,6 +133,95 @@ class DataCollatorForMLMQuery(DataCollatorForConditionalMLM):
         # make BERT inputs
         input_ids = example['input_ids'].repeat((self.num_samples, 1))
         input_ids.masked_fill_(masks, value=self.tokenizer.mask_token_id)
+        attention_mask = example['attention_mask'].repeat((self.num_samples, 1))
+        token_type_ids = example['token_type_ids'].repeat((self.num_samples, 1))
+
+        return {
+            "id": example["id"],
+            "input_ids": input_ids,
+            "token_type_ids": token_type_ids,
+            "attention_mask": attention_mask,
+            "masks": masks,
+        }
+
+
+@dataclass
+class DataCollatorForSpanMLMQuery(DataCollatorForMLMQuery):
+    """
+    Sequentially mask each token in a dataset so that we can query the logits
+
+    TODO: Is masking necessary? Can't we just get the outputs of the model on the
+    complete, unmasked data?
+    """
+    num_samples: int = 7 # TODO: change this number?
+
+    def convert_example(self, example):
+        """
+        Change masking to never split on WordPieces
+        """
+        # TODO
+        # Could improve
+        target_mask = example['token_type_ids'].bool()
+        tgt = example['input_ids'][target_mask]
+
+        # build the random masks
+        tgt_len = example['token_type_ids'].sum().item()
+        src_len = len(example['token_type_ids']) - tgt_len
+        if tgt_len <= self.num_samples:
+            masks = torch.eye(tgt_len).byte()
+            self.num_samples = tgt_len
+        else:
+            mask_inds = [list(range(i, tgt_len, self.num_samples))
+                        for i in range(self.num_samples)]
+            masks = torch.zeros(self.num_samples, tgt_len).byte()
+            for i, indices in enumerate(mask_inds):
+                for j in indices:
+                    masks.data[i, j] = 1
+        assert (masks.sum(dim=0) != torch.ones(tgt_len).long()).sum().item() == 0
+        assert masks.sum().item() == tgt_len
+
+        # Expand masks so that they are always contiguous
+        # Slow, but this is only run once
+        contig_masks = masks.clone()
+        
+        # first, look at the 
+        tgt_toks = self.tokenizer.convert_ids_to_tokens(tgt)
+        word_parts = torch.tensor(
+            [
+                tgt_toks[i].startswith("##") or tgt_toks[i + 1].startswith("##")
+                for i in range(tgt_len - 1)
+            ] + [False],
+        )
+        for mask in contig_masks:
+            inside_tokens = torch.where(mask & word_parts)[0]
+            for idx in inside_tokens:
+                left, right = 1, 1
+                while True:
+                    if not tgt_toks[idx].startswith("##"):
+                        left = 0 # means the masked token is a starting word
+                    if left > 0:
+                        is_start = not tgt_toks[idx-left].startswith("##")
+                        mask[idx-left] = word_parts[idx-left].item() or is_start
+                        if is_start:
+                            left = 0
+                    if right > 0:
+                        is_continuing = tgt_toks[idx+right].startswith("##")
+                        mask[idx+right] = is_continuing
+                        if not is_continuing:
+                            right = 0
+                    if right == left == 0:
+                        break
+                    right += 1
+                    left += 1
+
+        masks = torch.cat([torch.zeros(self.num_samples, src_len).byte(), masks], dim=1)
+        masks = masks.bool()
+        contig_masks = torch.cat([torch.zeros(self.num_samples, src_len).byte(), contig_masks], dim=1)
+        contig_masks = contig_masks.bool()
+
+        # make BERT inputs
+        input_ids = example['input_ids'].repeat((self.num_samples, 1))
+        input_ids.masked_fill_(contig_masks, value=self.tokenizer.mask_token_id)
         attention_mask = example['attention_mask'].repeat((self.num_samples, 1))
         token_type_ids = example['token_type_ids'].repeat((self.num_samples, 1))
 
@@ -182,22 +271,33 @@ def build_db_batched(
     out_db,
     model,
     tokenizer,
+    truncation,
     batch_size=8,
     output_dtype=np.float32,
+    mask_spans=False,
+    num_samples=7,
 ):
     """
     Use the model to give outputs for each target token in the dataset
     """
     dataset = LineByLinePairedTextDatasetWithID(
-        tokenizer, source_path, target_path, tokenizer.max_len
+        tokenizer=tokenizer,
+        source_file_path=source_path,
+        target_file_path=target_path,
+        block_size=tokenizer.max_len,
+        truncation=truncation,
     )
-    data_collator = DataCollatorForMLMQuery(tokenizer=tokenizer, num_samples=7)
+    if mask_spans:
+        data_collator = DataCollatorForSpanMLMQuery(tokenizer=tokenizer, num_samples=num_samples)
+    else:
+        data_collator = DataCollatorForMLMQuery(tokenizer=tokenizer, num_samples=num_samples)
+
     loader = DataLoader(
         dataset=dataset,
         shuffle=False,
         batch_size=batch_size,
         num_workers=4,
-        collate_fn=data_collator
+        collate_fn=data_collator,
     )
     with tqdm(desc='computing BERT features', total=len(dataset)) as pbar:
         for batch in loader:
@@ -217,7 +317,11 @@ def main(opts):
     )
 
     # load model & tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(opts.model_name_or_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(opts.model_name_or_path)
+    except OSError:
+        logger.warning("Tokenizer not in named directory. Checking parent directory")
+        tokenizer = AutoTokenizer.from_pretrained(f"{opts.model_name_or_path}/..")
 
     model = AutoModelForMaskedLM.from_pretrained(opts.model_name_or_path)
     model.eval()
@@ -245,8 +349,11 @@ def main(opts):
             out_db=out_db,
             model=model,
             tokenizer=tokenizer,
+            truncation=opts.truncation_strategy,
             batch_size=opts.batch_size,
             output_dtype=np.float16 if opts.fp16 else np.float32,
+            mask_spans=opts.mask_spans,
+            num_samples=opts.num_samples,
         )
 
 
@@ -263,6 +370,9 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action="store_true", default=False)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--overwrite', action="store_true", default=False)
+    parser.add_argument('--mask_spans', action="store_true", default=False)
+    parser.add_argument('--num_samples', type=int, default=7)
+    parser.add_argument('--truncation_strategy', default="longest_first")
     args = parser.parse_args()
 
     main(args)

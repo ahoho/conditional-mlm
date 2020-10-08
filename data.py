@@ -2,11 +2,15 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, List
 
+import numpy as np
+
 import torch
 from torch.utils.data.dataset import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 from transformers import PreTrainedTokenizer
+
+from span_masking import ParagraphInfo, PairWithSpanMaskingScheme
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +24,8 @@ class LineByLinePairedTextDataset(Dataset):
         source_file_path: str,
         target_file_path: str,
         block_size: int,
+        truncation: bool = True,
+        **kwargs,
     ):
         """
         Read source and target lines from 
@@ -33,8 +39,8 @@ class LineByLinePairedTextDataset(Dataset):
             source_lines,
             target_lines,
             add_special_tokens=True,
-            truncation=True,
             max_length=block_size,
+            truncation=truncation,
         )
 
     @staticmethod
@@ -52,19 +58,17 @@ class LineByLinePairedTextDataset(Dataset):
     def __getitem__(self, i) -> Dict[str, List[int]]:
         return {k: torch.tensor(v[i], dtype=torch.long) for k, v in self.examples.items()}
 
+
 @dataclass
-class DataCollatorForConditionalMLM:
+class SimpleDataCollator:
     """
     Modified DataCollatorForLanguageModeling from transformers.data.data_collator
     """
 
     tokenizer: PreTrainedTokenizer
-    mlm_probability: float = 0.15
 
     def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        # NB: this is always a MLM
-        batch = self._tensorize_batch(examples)
-        return self.mask_tokens(batch)
+        return self._tensorize_batch(examples)
 
     def _tensorize_batch(self, examples: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         if len(examples) == 1:
@@ -84,6 +88,17 @@ class DataCollatorForConditionalMLM:
         return pad_sequence(
             seq, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
+
+
+@dataclass
+class MaskingDataCollator(SimpleDataCollator):
+
+    mlm_probability: float = 0.15
+
+    def __call__(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        # NB: this is always a MLM
+        batch = self._tensorize_batch(examples)
+        return self.mask_tokens(batch)
 
     def mask_tokens(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -132,3 +147,88 @@ class DataCollatorForConditionalMLM:
 
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged
         return batch
+
+
+class DummyArgs:
+    pass
+
+
+class SpanBertDataset(LineByLinePairedTextDataset):
+    """
+    Args:
+        dataset (BlockDataset): dataset to wrap
+        sizes (List[int]): sentence lengths
+        vocab (~fairseq.data.Dictionary): vocabulary
+        shuffle (bool, optional): shuffle the elements before batching.
+          Default: ``True``
+    """
+    def __init__(
+        self,
+        tokenizer,
+        source_file_path,
+        target_file_path,
+        block_size,
+        truncation=True,
+        mlm_probability=0.15,
+    ):
+        super().__init__(
+            tokenizer,
+            source_file_path,
+            target_file_path,
+            block_size,
+            truncation=truncation
+        )
+        self.tokenizer = tokenizer
+        self.paragraph_info = ParagraphInfo(tokenizer)
+
+        # TODO: Support these args in training, rather than hard-coding
+        args = DummyArgs()
+        args.max_pair_targets = 15 # unused
+        args.span_lower = 1
+        args.span_upper = 10
+        args.geometric_p = 0.2
+        args.tagged_anchor_prob = 0.
+        args.return_only_spans = False
+        args.replacement_method = "span"
+        args.endpoints = "external"
+        args.mask_ratio = mlm_probability
+
+        self.masking_scheme = PairWithSpanMaskingScheme(
+            args,
+            tokens=list(tokenizer.get_vocab().values()),
+            pad=-100, # fills out the rest of the targets/labels
+            mask_id=tokenizer.mask_token_id,
+            paragraph_info=self.paragraph_info,
+        )
+        
+
+    def __getitem__(self, index):
+        example = {k: np.array(v[index]) for k, v in self.examples.items()}
+        inputs = example['input_ids']
+        token_type_ids = example['token_type_ids']
+
+        source = inputs[token_type_ids == 0]
+        target = inputs[token_type_ids == 1][:-1] # no trailing [SEP]
+
+        masked_block, masked_tgt, _ = self._mask_block(target, tagmap=None)
+
+        masked_inputs = np.concatenate([source, masked_block, [self.tokenizer.sep_token_id]])
+        target = np.concatenate([np.full(source.shape[0], -100), masked_tgt, [-100]])
+        return {
+            "input_ids": torch.tensor(masked_inputs, dtype=torch.long),
+            "labels": torch.tensor(target, dtype=torch.long),
+            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
+            "attention_mask":  torch.tensor(example["attention_mask"], dtype=torch.long),
+        }
+
+
+    def _mask_block(self, sentence, tagmap):
+        """mask tokens for masked language model training
+        Args:
+            sentence: 1d tensor, token list to be masked
+            mask_ratio: ratio of tokens to be masked in the sentence
+        Return:
+            masked_sent: masked sentence
+        """
+        block = self.masking_scheme.mask(sentence, tagmap)
+        return block

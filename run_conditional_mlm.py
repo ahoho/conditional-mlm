@@ -25,8 +25,12 @@ from transformers import (
     set_seed,
 )
 
-from data import LineByLinePairedTextDataset, DataCollatorForConditionalMLM
-
+from data import (
+    LineByLinePairedTextDataset,
+    SpanBertDataset,
+    SimpleDataCollator,
+    MaskingDataCollator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +89,23 @@ class DataTrainingArguments:
         metadata={"help": "An optional input evaluation target file to evaluate the perplexity on (a text file)."},
     )
 
+
     added_tokens_file: Optional[str] = field(
         default=None, metadata={"help": "Location of added tokens"},
+    )
+
+    truncation_strategy: Optional[str] = field(
+        default="longest_first", metadata={"help": "How to truncate long sequences"}
     )
 
     mlm_probability: float = field(
         default=0.15, metadata={"help": "Ratio of tokens to mask for masked language modeling loss"}
     )
+    
+    mask_spans: bool = field(
+        default=False, metadata={"help": "Use span masking"}
+    )
+
 
     block_size: int = field(
         default=-1,
@@ -109,11 +123,18 @@ class DataTrainingArguments:
 def get_dataset(args: DataTrainingArguments, tokenizer: PreTrainedTokenizer, evaluate=False):
     source_file = args.eval_source_file if evaluate else args.train_source_file
     target_file = args.eval_target_file if evaluate else args.train_target_file
-    return LineByLinePairedTextDataset(
+    if args.mask_spans:
+        dataset_class = SpanBertDataset
+    if not args.mask_spans:
+        dataset_class = LineByLinePairedTextDataset
+    
+    return dataset_class(
         tokenizer=tokenizer,
         source_file_path=Path(args.data_dir, source_file),
         target_file_path=Path(args.data_dir, target_file),
-        block_size=args.block_size
+        block_size=args.block_size,
+        truncation=args.truncation_strategy,
+        mlm_probability=args.mlm_probability, # only used for SpanBertDataset
     )
 
 
@@ -181,10 +202,15 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
+
     if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, cache_dir=model_args.cache_dir)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name, cache_dir=model_args.cache_dir,
+        )
     elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path, cache_dir=model_args.cache_dir,
+        )
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported, but you can do it from another script, save it,"
@@ -206,7 +232,7 @@ def main():
     if data_args.added_tokens_file is not None:
         with open(data_args.added_tokens_file, "r") as infile:
             added_tokens = json.load(infile)
-    tokenizer.add_tokens(added_tokens)
+        tokenizer.add_tokens(added_tokens)
 
     model.resize_token_embeddings(len(tokenizer))
 
@@ -220,13 +246,16 @@ def main():
         data_args.block_size = min(data_args.block_size, tokenizer.max_len)
 
     # Get datasets
-
     train_dataset = get_dataset(data_args, tokenizer=tokenizer) if training_args.do_train else None
     eval_dataset = get_dataset(data_args, tokenizer=tokenizer, evaluate=True) if training_args.do_eval else None
-    data_collator = DataCollatorForConditionalMLM(
-        tokenizer=tokenizer,
-        mlm_probability=data_args.mlm_probability
-    )
+
+    if not data_args.mask_spans: 
+        data_collator = MaskingDataCollator(
+            tokenizer=tokenizer,
+            mlm_probability=data_args.mlm_probability,
+        )
+    else:
+        data_collator = SimpleDataCollator(tokenizer=tokenizer)
 
     # Initialize our Trainer
     trainer = Trainer(
